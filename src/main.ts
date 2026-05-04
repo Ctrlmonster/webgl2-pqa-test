@@ -369,7 +369,17 @@ vec4 moveVec4(vec4 cur, vec4 h, vec4 v, vec4 d, ivec2 currentLane, ivec2 sourceL
   if ( sameX &&  sameY) return cur; if (!sameX && sameY) return h; if (sameX && !sameY) return v; return d;
 }
 float laneMatches(ivec2 a, ivec2 b) { return (a.x == b.x && a.y == b.y) ? 1.0 : 0.0; }
-float laneFractionalValue(ivec2 lane) { int byteValue = 32 + lane.x * 64 + lane.y * 128; return float(byteValue) / 255.0; }
+float laneFractionalValue(ivec2 lane) {
+  // Deliberately non-affine over the 2x2 quad.
+  // This catches implementations where dFdx/dFdy behave like one coarse
+  // derivative per quad, which can reconstruct affine ramps but not arbitrary
+  // per-lane messages.
+  int idx = lane.x + lane.y * 2;
+  if (idx == 0) return 32.0 / 255.0;
+  if (idx == 1) return 113.0 / 255.0;
+  if (idx == 2) return 181.0 / 255.0;
+  return 77.0 / 255.0;
+}
 float laneRealFloatValue(ivec2 lane) {
   int idx = lane.x + lane.y * 2;
   if (idx == 0) return 0.03125;
@@ -377,8 +387,22 @@ float laneRealFloatValue(ivec2 lane) {
   if (idx == 2) return 0.61803399;
   return 0.9375;
 }
-vec2 laneVec2Value(ivec2 lane) { int idx = lane.x + lane.y * 2; return vec2(float(17 + idx * 37) / 255.0, float(211 - idx * 29) / 255.0); }
-vec4 laneVec4Value(ivec2 lane) { int idx = lane.x + lane.y * 2; return vec4(float(23 + idx * 31) / 255.0, float(71 + idx * 17) / 255.0, float(197 - idx * 23) / 255.0, float(149 - idx * 11) / 255.0); }
+vec2 laneVec2Value(ivec2 lane) {
+  // Also deliberately non-affine component-wise.
+  int idx = lane.x + lane.y * 2;
+  if (idx == 0) return vec2(17.0, 211.0) / 255.0;
+  if (idx == 1) return vec2(83.0, 29.0) / 255.0;
+  if (idx == 2) return vec2(197.0, 143.0) / 255.0;
+  return vec2(41.0, 251.0) / 255.0;
+}
+vec4 laneVec4Value(ivec2 lane) {
+  // Deliberately non-affine component-wise.
+  int idx = lane.x + lane.y * 2;
+  if (idx == 0) return vec4(23.0, 71.0, 197.0, 149.0) / 255.0;
+  if (idx == 1) return vec4(139.0, 11.0, 53.0, 223.0) / 255.0;
+  if (idx == 2) return vec4(5.0, 173.0, 241.0, 37.0) / 255.0;
+  return vec4(211.0, 97.0, 19.0, 181.0) / 255.0;
+}
 float expectedScalarForLane(ivec2 lane) { return uRealFloatValues != 0 ? laneRealFloatValue(lane) : laneFractionalValue(lane); }
 float getScalarSource(ivec2 pixel, ivec2 lane) {
   if (uSourceMode == 1) return texelFetch(uTestTex, pixel, 0).r;
@@ -648,7 +672,10 @@ function createResultTexture(
 }
 
 function laneFractionalByte(lane: Lane): number {
-  return 32 + lane[0] * 64 + lane[1] * 128;
+  // Deliberately non-affine over the 2x2 quad. Keep this in sync with
+  // laneFractionalValue() in the broadcast fragment shader.
+  const idx = lane[0] + lane[1] * 2;
+  return [32, 113, 181, 77][idx];
 }
 
 function laneRealFloatValue(lane: Lane): number {
@@ -919,7 +946,15 @@ function drawPixelsToCanvas(
   ctx.putImageData(image, 0, 0);
 }
 
+function derivativeHintName(gl: WebGL2RenderingContext, value: number): string {
+  if (value === gl.FASTEST) return 'FASTEST';
+  if (value === gl.NICEST) return 'NICEST';
+  if (value === gl.DONT_CARE) return 'DONT_CARE';
+  return `0x${value.toString(16)}`;
+}
+
 function makeGlInfo(gl: WebGL2RenderingContext): Record<string, string> {
+  const derivativeHint = gl.getParameter(gl.FRAGMENT_SHADER_DERIVATIVE_HINT);
   return {
     VENDOR: String(gl.getParameter(gl.VENDOR)),
     RENDERER: String(gl.getParameter(gl.RENDERER)),
@@ -927,6 +962,10 @@ function makeGlInfo(gl: WebGL2RenderingContext): Record<string, string> {
     SHADING_LANGUAGE_VERSION: String(
       gl.getParameter(gl.SHADING_LANGUAGE_VERSION)
     ),
+    FRAGMENT_SHADER_DERIVATIVE_HINT: `${derivativeHintName(
+      gl,
+      derivativeHint
+    )} (${derivativeHint})`,
   };
 }
 
@@ -955,6 +994,14 @@ class TestRunner {
       preserveDrawingBuffer: false,
     });
     if (!gl) throw new Error('WebGL2 not available.');
+
+    // Ask for the highest-quality derivative path before compiling/running any
+    // derivative shaders. This is only a hint, not a guarantee, but the report
+    // records the resulting state so we can see whether it changes behavior on
+    // any browser/GPU stack.
+    gl.hint(gl.FRAGMENT_SHADER_DERIVATIVE_HINT, gl.NICEST);
+    assertNoGlError(gl, 'set FRAGMENT_SHADER_DERIVATIVE_HINT to NICEST');
+
     this.gl = gl;
 
     const vao = gl.createVertexArray();
@@ -1003,10 +1050,7 @@ class TestRunner {
     return pixels;
   }
 
-  clearAndDraw(
-    program: WebGLProgram,
-    viewport: { x: number; y: number; width: number; height: number }
-  ) {
+  clearAndDraw(program: WebGLProgram, viewport: { x: number; y: number; width: number; height: number }) {
     const gl = this.gl;
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
@@ -1098,15 +1142,7 @@ function runBroadcastTest(
         failedPixels: analysis.failedPixels,
       });
 
-      copyRegionIntoComposite(
-        composite,
-        VIS_W,
-        pixels,
-        TEST_W,
-        TEST_H,
-        i * TEST_W,
-        0
-      );
+      copyRegionIntoComposite(composite, VIS_W, pixels, TEST_W, TEST_H, i * TEST_W, 0);
       if (sourceTexture) gl.deleteTexture(sourceTexture);
     }
   } catch (err) {
@@ -1147,13 +1183,7 @@ function runSimpleDraw(
     framebufferWidth?: number;
     framebufferHeight?: number;
     viewport?: { x: number; y: number; width: number; height: number };
-    analyzeRegion?: {
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-      visualXOffset?: number;
-    };
+    analyzeRegion?: { x: number; y: number; width: number; height: number; visualXOffset?: number };
     informational?: boolean;
   }
 ): SimpleRunResult {
@@ -1176,8 +1206,7 @@ function runSimpleDraw(
 
   let texture: WebGLTexture | null = null;
   let program: WebGLProgram | null = null;
-  let fb: { framebuffer: WebGLFramebuffer; texture: WebGLTexture } | null =
-    null;
+  let fb: { framebuffer: WebGLFramebuffer; texture: WebGLTexture } | null = null;
 
   try {
     program = createProgram(gl, vertexSource, shader);
@@ -1245,10 +1274,7 @@ function runSimpleDraw(
   }
 }
 
-function runViewportOffsetProbe(
-  runner: TestRunner,
-  canvas: HTMLCanvasElement
-): SimpleRunResult {
+function runViewportOffsetProbe(runner: TestRunner, canvas: HTMLCanvasElement): SimpleRunResult {
   return runSimpleDraw(
     runner,
     canvas,
@@ -1288,10 +1314,7 @@ function runRobustnessProbe(
   );
 }
 
-function runJbuTest(
-  runner: TestRunner,
-  canvas: HTMLCanvasElement
-): SimpleRunResult {
+function runJbuTest(runner: TestRunner, canvas: HTMLCanvasElement): SimpleRunResult {
   return runSimpleDraw(
     runner,
     canvas,
@@ -1347,10 +1370,7 @@ function runSamplingTest(
   );
 }
 
-function runManualShadowTest(
-  runner: TestRunner,
-  canvas: HTMLCanvasElement
-): SimpleRunResult {
+function runManualShadowTest(runner: TestRunner, canvas: HTMLCanvasElement): SimpleRunResult {
   return runSimpleDraw(
     runner,
     canvas,
@@ -1372,10 +1392,7 @@ function runManualShadowTest(
   );
 }
 
-function runSamplerShadowTest(
-  runner: TestRunner,
-  canvas: HTMLCanvasElement
-): SimpleRunResult {
+function runSamplerShadowTest(runner: TestRunner, canvas: HTMLCanvasElement): SimpleRunResult {
   return runSimpleDraw(
     runner,
     canvas,
@@ -1408,11 +1425,7 @@ function totalPassFail(result: TestResult) {
 }
 
 function testPassed(result: TestResult): boolean {
-  return (
-    !result.skipped &&
-    totalPassFail(result).fail === 0 &&
-    result.sourceResults.length === SOURCE_LANES.length
-  );
+  return !result.skipped && totalPassFail(result).fail === 0 && result.sourceResults.length === SOURCE_LANES.length;
 }
 
 function simplePassed(result: SimpleResult): boolean {
@@ -1525,50 +1538,25 @@ function statusLine(ok: boolean, label: string, warning = false): string {
   return `<div style="margin:3px 0;">${icon} ${escapeHtml(label)}</div>`;
 }
 
-function detailsBlock(
-  title: string,
-  body: string,
-  state: 'pass' | 'fail' | 'skip' | 'info' | 'expected'
-): string {
-  const icon =
-    state === 'pass'
-      ? '✅'
-      : state === 'fail'
-      ? '❌'
-      : state === 'skip'
-      ? '⏭️'
-      : state === 'expected'
-      ? '✅'
-      : 'ℹ️';
-  const border =
-    state === 'fail' ? '#5a2a2a' : state === 'skip' ? '#5a4a2a' : '#2a3140';
-  const background =
-    state === 'fail' ? '#211719' : state === 'skip' ? '#211d15' : '#111722';
+function detailsBlock(title: string, body: string, state: 'pass' | 'fail' | 'skip' | 'info' | 'expected'): string {
+  const icon = state === 'pass' ? '✅' : state === 'fail' ? '❌' : state === 'skip' ? '⏭️' : state === 'expected' ? '✅' : 'ℹ️';
+  const border = state === 'fail' ? '#5a2a2a' : state === 'skip' ? '#5a4a2a' : '#2a3140';
+  const background = state === 'fail' ? '#211719' : state === 'skip' ? '#211d15' : '#111722';
   return `
     <details style="margin:8px 0;border:1px solid ${border};border-radius:10px;background:${background};overflow:hidden;">
       <summary style="padding:10px 12px;cursor:pointer;font-weight:650;color:#e8ecf1;">
         ${icon} ${escapeHtml(title)}
       </summary>
-      <pre style="margin:0;padding:12px;border-top:1px solid ${border};white-space:pre-wrap;overflow:auto;color:#cfd8e3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.45;">${escapeHtml(
-    body
-  )}</pre>
+      <pre style="margin:0;padding:12px;border-top:1px solid ${border};white-space:pre-wrap;overflow:auto;color:#cfd8e3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.45;">${escapeHtml(body)}</pre>
     </details>`;
 }
 
 function broadcastDetailBlock(result: TestResult): string {
-  const state: 'pass' | 'fail' | 'skip' = result.skipped
-    ? 'skip'
-    : testPassed(result)
-    ? 'pass'
-    : 'fail';
+  const state: 'pass' | 'fail' | 'skip' = result.skipped ? 'skip' : testPassed(result) ? 'pass' : 'fail';
   return detailsBlock(result.name, formatTestResult(result), state);
 }
 
-function simpleDetailBlock(
-  result: SimpleResult,
-  extra: string,
-  expectedFailure = false
-): string {
+function simpleDetailBlock(result: SimpleResult, extra: string, expectedFailure = false): string {
   let state: 'pass' | 'fail' | 'skip' | 'info' | 'expected';
   if (result.skipped) state = 'skip';
   else if (expectedFailure) state = result.failCount > 0 ? 'expected' : 'info';
@@ -1679,7 +1667,8 @@ try {
     fractionalScalarBroadcast:
       testPassed(fracProc.result) && testPassed(fracTex.result),
     realFloatR32FBroadcast: testPassed(floatTex.result),
-    vectorBroadcast: testPassed(vec2Test.result) && testPassed(vec4Test.result),
+    vectorBroadcast:
+      testPassed(vec2Test.result) && testPassed(vec4Test.result),
     jbuGather: simplePassed(jbuTest.result),
     textureNearestGather: simplePassed(nearestTest.result),
     textureLinearGather: simplePassed(linearTest.result),
@@ -1695,14 +1684,12 @@ try {
 
   const milestone1Passed = capabilities.scalarBroadcast;
   const milestone2Passed =
-    capabilities.fractionalScalarBroadcast &&
-    capabilities.realFloatR32FBroadcast;
+    capabilities.fractionalScalarBroadcast && capabilities.realFloatR32FBroadcast;
   const milestone3Passed = capabilities.vectorBroadcast;
   const milestone4Passed = capabilities.jbuGather;
   const milestone5Passed = capabilities.textureNearestLinearGather;
   const milestone6Passed =
-    capabilities.manualDepthShadowCompareGather &&
-    capabilities.shadowSamplerGather;
+    capabilities.manualDepthShadowCompareGather && capabilities.shadowSamplerGather;
   const milestone7Complete =
     !viewportOffsetProbe.result.skipped &&
     !oddSizeProbe.result.skipped &&
@@ -1824,54 +1811,23 @@ try {
   resultEl.innerHTML = `
     <section style="margin-bottom:14px;padding:14px;border-radius:10px;background:#111722;border:1px solid #263044;">
       <div style="font-size:18px;font-weight:750;margin-bottom:8px;">Quick status</div>
-      <div style="font-size:15px;margin-bottom:10px;color:${
-        allRequiredPassed ? '#bdf7c8' : '#ffc9c9'
-      };">
-        ${
-          allRequiredPassed
-            ? '✅ Overall: all required PQA derivative message-passing tests passed.'
-            : '❌ Overall: one or more required PQA tests failed or were skipped.'
-        }
+      <div style="font-size:15px;margin-bottom:10px;color:${allRequiredPassed ? '#bdf7c8' : '#ffc9c9'};">
+        ${allRequiredPassed
+          ? '✅ Overall: all required PQA derivative message-passing tests passed.'
+          : '❌ Overall: one or more required PQA tests failed or were skipped.'}
       </div>
       <div style="font-weight:700;margin:12px 0 5px;">Required capabilities</div>
-      ${statusLine(
-        capabilities.scalarBroadcast,
-        'Scalar broadcast (procedural + RGBA8 texture)'
-      )}
-      ${statusLine(
-        capabilities.fractionalScalarBroadcast,
-        'Fractional scalar broadcast (procedural + RGBA8 texture)'
-      )}
-      ${statusLine(
-        capabilities.realFloatR32FBroadcast,
-        'Real-float R32F broadcast'
-      )}
-      ${statusLine(
-        capabilities.vectorBroadcast,
-        'Vector broadcast (vec2 + vec4)'
-      )}
+      ${statusLine(capabilities.scalarBroadcast, 'Scalar broadcast (procedural + RGBA8 texture)')}
+      ${statusLine(capabilities.fractionalScalarBroadcast, 'Fractional scalar broadcast (procedural + RGBA8 texture)')}
+      ${statusLine(capabilities.realFloatR32FBroadcast, 'Real-float R32F broadcast')}
+      ${statusLine(capabilities.vectorBroadcast, 'Vector broadcast (vec2 + vec4)')}
       ${statusLine(capabilities.jbuGather, 'JBU-shaped half-res gather')}
-      ${statusLine(
-        capabilities.textureNearestGather,
-        'texture() NEAREST offset gather'
-      )}
-      ${statusLine(
-        capabilities.textureLinearGather,
-        'texture() LINEAR offset gather'
-      )}
-      ${statusLine(
-        capabilities.manualDepthShadowCompareGather,
-        'Manual depth shadow compare gather'
-      )}
-      ${statusLine(
-        capabilities.shadowSamplerGather,
-        'sampler2DShadow compare gather'
-      )}
+      ${statusLine(capabilities.textureNearestGather, 'texture() NEAREST offset gather')}
+      ${statusLine(capabilities.textureLinearGather, 'texture() LINEAR offset gather')}
+      ${statusLine(capabilities.manualDepthShadowCompareGather, 'Manual depth shadow compare gather')}
+      ${statusLine(capabilities.shadowSamplerGather, 'sampler2DShadow compare gather')}
       <div style="font-weight:700;margin:12px 0 5px;">Informational probes</div>
-      ${statusLine(
-        capabilities.viewportOffsetProbePassed,
-        'Viewport offset probe'
-      )}
+      ${statusLine(capabilities.viewportOffsetProbePassed, 'Viewport offset probe')}
       ${statusLine(capabilities.oddSizeProbePassed, 'Odd-size target probe')}
       ${statusLine(
         capabilities.invalidDivergentBranchDemoFailedAsExpected,
@@ -1883,11 +1839,9 @@ try {
     <section style="margin-bottom:14px;padding:14px;border-radius:10px;background:#111722;border:1px solid #263044;">
       <div style="font-size:16px;font-weight:750;margin-bottom:4px;">Practical meaning</div>
       <div style="color:#cfd8e3;">
-        ${
-          allRequiredPassed
-            ? 'PQA looks viable for the tested scalar/vector, JBU, blur/bloom, and shadow-like paths. Use the robustness probes to decide where to apply fallbacks or warnings.'
-            : 'Enable only the specific capability buckets that passed. Keep failed or skipped PQA fast paths disabled on this device/browser.'
-        }
+        ${allRequiredPassed
+          ? 'PQA looks viable for the tested scalar/vector, JBU, blur/bloom, and shadow-like paths. Use the robustness probes to decide where to apply fallbacks or warnings.'
+          : 'Enable only the specific capability buckets that passed. Keep failed or skipped PQA fast paths disabled on this device/browser.'}
       </div>
     </section>
 
@@ -1899,14 +1853,13 @@ try {
 
     <section style="margin-top:14px;padding:14px;border-radius:10px;background:#111722;border:1px solid #263044;">
       <div style="font-size:16px;font-weight:750;margin-bottom:8px;">GL info</div>
-      <pre style="margin:0;white-space:pre-wrap;color:#cfd8e3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.45;">${escapeHtml(
-        [
-          `VENDOR:                   ${runner.glInfo.VENDOR}`,
-          `RENDERER:                 ${runner.glInfo.RENDERER}`,
-          `VERSION:                  ${runner.glInfo.VERSION}`,
-          `SHADING_LANGUAGE_VERSION: ${runner.glInfo.SHADING_LANGUAGE_VERSION}`,
-        ].join(NL)
-      )}</pre>
+      <pre style="margin:0;white-space:pre-wrap;color:#cfd8e3;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.45;">${escapeHtml([
+        `VENDOR:                   ${runner.glInfo.VENDOR}`,
+        `RENDERER:                 ${runner.glInfo.RENDERER}`,
+        `VERSION:                  ${runner.glInfo.VERSION}`,
+        `SHADING_LANGUAGE_VERSION: ${runner.glInfo.SHADING_LANGUAGE_VERSION}`,
+          `FRAGMENT_SHADER_DERIVATIVE_HINT: ${runner.glInfo.FRAGMENT_SHADER_DERIVATIVE_HINT}`,
+      ].join(NL))}</pre>
     </section>
   `;
 } catch (err) {
